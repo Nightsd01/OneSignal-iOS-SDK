@@ -33,6 +33,11 @@
 #import "OneSignalClient.h"
 #import "Requests.h"
 
+#define LOCATION_WHEN_IN_USE_KEY @"NSLocationWhenInUseUsageDescription"
+#define LOCATION_ALWAYS_KEY @"NSLocationAlwaysUsageDescription"
+#define LOCATION_COMBINED_KEY @"NSLocationAlwaysAndWhenInUseUsageDescription"
+
+
 @interface OneSignal ()
 void onesignal_Log(ONE_S_LOG_LEVEL logLevel, NSString* message);
 + (NSString *)mEmailUserId;
@@ -53,6 +58,7 @@ UIBackgroundTaskIdentifier fcTask;
 static id locationManager = nil;
 static bool started = false;
 static bool hasDelayed = false;
+static bool usingSignificantChangeService = false;
 
 // CoreLocation must be statically linked for geotagging to work on iOS 6 and possibly 7.
 // plist NSLocationUsageDescription (iOS 6 & 7) and NSLocationWhenInUseUsageDescription (iOS 8+) keys also required.
@@ -88,7 +94,7 @@ static OneSignalLocation* singleInstance = nil;
 }
 + (void)clearLastLocation {
     @synchronized(OneSignalLocation.mutexObjectForLastLocation) {
-       lastLocation = nil;
+        lastLocation = nil;
     }
 }
 
@@ -113,22 +119,22 @@ static OneSignalLocation* singleInstance = nil;
     if ([OneSignal requiresUserPrivacyConsent])
         return;
     
-    if(!locationManager || !started) return;
+    if(!locationManager || !started || usingSignificantChangeService) return;
     
     /**
      We have a state switch
      - If going to active: keep timer going
      - If going to background:
-        1. Make sure that we can track background location
-            -> continue timer to send location otherwise set location to nil
-        Otherwise set timer to NULL
-    **/
+     1. Make sure that we can track background location
+     -> continue timer to send location otherwise set location to nil
+     Otherwise set timer to NULL
+     **/
     
     
     NSTimeInterval remainingTimerTime = sendLocationTimer.fireDate.timeIntervalSinceNow;
     NSTimeInterval requiredWaitTime = isActive ? foregroundSendLocationWaitTime : backgroundSendLocationWaitTime ;
     NSTimeInterval adjustedTime = remainingTimerTime > 0 ? remainingTimerTime : requiredWaitTime;
-
+    
     if(isActive) {
         if(sendLocationTimer && initialLocationSent) {
             //Keep timer going with the remaining time
@@ -179,30 +185,32 @@ static OneSignalLocation* singleInstance = nil;
     [locationManager setValue:[self sharedInstance] forKey:@"delegate"];
     
     float deviceOSVersion = [[[UIDevice currentDevice] systemVersion] floatValue];
+    
     if (deviceOSVersion >= 8.0) {
         
         //Check info plist for request descriptions
         //LocationAlways > LocationWhenInUse > No entry (Log error)
         //Location Always requires: Location Background Mode + NSLocationAlwaysUsageDescription
         NSArray* backgroundModes = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIBackgroundModes"];
-        NSString* alwaysDescription = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSLocationAlwaysUsageDescription"] ?: [[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSLocationAlwaysAndWhenInUseUsageDescription"];
+        NSString* alwaysDescription = [[NSBundle mainBundle] objectForInfoDictionaryKey:LOCATION_ALWAYS_KEY] ?: [[NSBundle mainBundle] objectForInfoDictionaryKey:LOCATION_COMBINED_KEY];
         if(backgroundModes && [backgroundModes containsObject:@"location"] && alwaysDescription) {
             [locationManager performSelector:@selector(requestAlwaysAuthorization)];
-            if (deviceOSVersion >= 9.0) {
-                [locationManager setValue:@YES forKey:@"allowsBackgroundLocationUpdates"];
+            
+            if ([clLocationManagerClass performSelector:@selector(significantLocationChangeMonitoringAvailable)]) {
+                // register for the significant change service
+                [locationManager performSelector:@selector(startMonitoringSignificantLocationChanges)];
+                
+                usingSignificantChangeService = true;
             }
-        }
-        
-        else if([[NSBundle mainBundle] objectForInfoDictionaryKey:@"NSLocationWhenInUseUsageDescription"])
+        } else if([[NSBundle mainBundle] objectForInfoDictionaryKey:LOCATION_WHEN_IN_USE_KEY])
             [locationManager performSelector:@selector(requestWhenInUseAuthorization)];
         
-        else onesignal_Log(ONE_S_LL_ERROR, @"Include a privacy NSLocationAlwaysUsageDescription or NSLocationWhenInUseUsageDescription in your info.plist to request location permissions.");
+        else onesignal_Log(ONE_S_LL_ERROR, [NSString stringWithFormat:@"Include a privacy %@ or %@ in your info.plist to request location permissions.", LOCATION_ALWAYS_KEY, LOCATION_WHEN_IN_USE_KEY]);
     }
     
     // iOS 6 and 7 prompts for location here.
-    [locationManager performSelector:@selector(startUpdatingLocation)];
-    
-    
+    if (!usingSignificantChangeService)
+        [locationManager performSelector:@selector(startUpdatingLocation)];
     
     started = true;
 }
@@ -214,8 +222,6 @@ static OneSignalLocation* singleInstance = nil;
     // return if the user has not granted privacy permissions
     if ([OneSignal requiresUserPrivacyConsent])
         return;
-    
-    [manager performSelector:@selector(stopUpdatingLocation)];
     
     id location = locations.lastObject;
     
@@ -237,16 +243,26 @@ static OneSignalLocation* singleInstance = nil;
         lastLocation->cords = cords;
     }
     
-    if(!sendLocationTimer)
-        [OneSignalLocation resetSendTimer];
+    if (!usingSignificantChangeService) {
+        [manager performSelector:@selector(stopUpdatingLocation)];
+        
+        if(!sendLocationTimer)
+            [OneSignalLocation resetSendTimer];
+    }
     
     if(!initialLocationSent)
         [OneSignalLocation sendLocation];
-
+    
 }
 
 -(void)locationManager:(id)manager didFailWithError:(NSError *)error {
     [OneSignal onesignal_Log:ONE_S_LL_ERROR message:[NSString stringWithFormat:@"CLLocationManager did fail with error: %@", error]];
+    
+    // unsubscribe for significant changes, code = 1 means permission was denied
+    if (usingSignificantChangeService && error.code == 1) {
+        [locationManager performSelector:@selector(stopMonitoringSignificantLocationChanges)];
+        usingSignificantChangeService = false;
+    }
 }
 
 + (void)resetSendTimer {
@@ -264,7 +280,7 @@ static OneSignalLocation* singleInstance = nil;
         if (!lastLocation || ![OneSignal mUserId]) return;
         
         //Fired from timer and not initial location fetched
-        if (initialLocationSent)
+        if (initialLocationSent && !usingSignificantChangeService)
             [OneSignalLocation resetSendTimer];
         
         initialLocationSent = YES;
